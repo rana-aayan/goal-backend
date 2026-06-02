@@ -66,7 +66,7 @@ def create_vault(vault: schemas.VaultCreate, db: Session = Depends(get_db)):
     return new_vault
 
 @app.get("/leaderboard/", response_model=list[schemas.UserResponse])
-def get_leaderboard(db: Session = Depends(get_db)):
+def get_user_leaderboard(db: Session = Depends(get_db)):
     top_users = db.query(models.User).order_by(models.User.total_saved.desc()).limit(10).all()
     
     # Active check: Reset streak to 0 if they haven't saved in over 48 hours
