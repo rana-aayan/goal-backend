@@ -1,14 +1,14 @@
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
+from datetime import datetime, date, timedelta
 import models, schemas
 from database import engine, SessionLocal
-from datetime import datetime, date, timedelta
 
-# Create tables
+# Create tables in Supabase
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
-    title="Goals Vault Backend",
+    title="Goal Backend",
     description="The engine powering the social saving network.",
     version="1.0.0"
 )
@@ -25,7 +25,9 @@ def get_db():
 def health_check():
     return {"status": "online", "message": "API is live."}
 
+# ==========================================
 # --- USER ENDPOINTS ---
+# ==========================================
 
 @app.post("/users/", response_model=schemas.UserResponse)
 def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
@@ -41,27 +43,40 @@ def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
     db.refresh(new_user)
     return new_user
 
-
-
-from fastapi import HTTPException
-
-# --- VAULT ENDPOINTS ---
-
-@app.post("/vaults/", response_model=schemas.VaultResponse)
-def create_vault(vault: schemas.VaultCreate, db: Session = Depends(get_db)):
-    # Verify the user actually exists first
-    user = db.query(models.User).filter(models.User.id == vault.owner_id).first()
+@app.get("/users/{target_user_id}/profile")
+def get_user_profile(target_user_id: int, db: Session = Depends(get_db)):
+    # 1. Find the user
+    user = db.query(models.User).filter(models.User.id == target_user_id).first()
     if not user:
-        raise HTTPException(status_code=404, detail="User not found.")
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # 2. Find all vaults belonging to this user
+    vaults = db.query(models.Vault).filter(models.Vault.owner_id == target_user_id).all()
+    
+    # 3. Format the vaults for the public profile
+    vault_data = []
+    for v in vaults:
+        vault_data.append({
+            "title": v.title,
+            "target": v.target,
+            "balance": v.balance,
+            "is_completed": v.balance >= v.target
+        })
+        
+    return {
+        "username": user.username,
+        "current_streak": user.current_streak,
+        "total_saved": user.total_saved,
+        "vaults": vault_data
+    }
 
-    new_vault = models.Vault(**vault.model_dump())
-    db.add(new_vault)
-    db.commit()
-    db.refresh(new_vault)
-    return new_vault
+# ==========================================
+# --- LEADERBOARD ENDPOINT ---
+# ==========================================
 
 @app.get("/leaderboard/", response_model=list[schemas.UserResponse])
 def get_leaderboard(db: Session = Depends(get_db)):
+    # Grab the top 10 users
     top_users = db.query(models.User).order_by(models.User.total_saved.desc()).limit(10).all()
     
     # Active check: Reset streak to 0 if they haven't saved in over 48 hours
@@ -79,9 +94,26 @@ def get_leaderboard(db: Session = Depends(get_db)):
             
     return top_users
 
+# ==========================================
+# --- VAULT ENDPOINTS ---
+# ==========================================
+
+@app.post("/vaults/", response_model=schemas.VaultResponse)
+def create_vault(vault: schemas.VaultCreate, db: Session = Depends(get_db)):
+    # Verify the user actually exists first
+    user = db.query(models.User).filter(models.User.id == vault.owner_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    new_vault = models.Vault(**vault.model_dump())
+    db.add(new_vault)
+    db.commit()
+    db.refresh(new_vault)
+    return new_vault
+
+# ==========================================
 # --- TRANSACTION & STREAK ENGINE ---
-
-
+# ==========================================
 
 @app.post("/transactions/", response_model=schemas.TransactionResponse)
 def create_transaction(transaction: schemas.TransactionCreate, db: Session = Depends(get_db)):
@@ -116,7 +148,6 @@ def create_transaction(transaction: schemas.TransactionCreate, db: Session = Dep
                 elif days_difference > 1:
                     # Missed a day. Streak shatters and resets to 1
                     user.current_streak = 1
-                # If days_difference == 0, they already deposited today; leave streak as is!
             else:
                 # First time depositing ever
                 user.current_streak = 1
@@ -136,33 +167,3 @@ def create_transaction(transaction: schemas.TransactionCreate, db: Session = Dep
     db.refresh(new_transaction)
 
     return new_transaction
-
-# --- PUBLIC PROFILE ENDPOINT ---
-
-@app.get("/users/{target_user_id}/profile")
-def get_user_profile(target_user_id: int, db: Session = Depends(get_db)):
-    # 1. Fetch the user's core stats
-    user = db.query(models.User).filter(models.User.id == target_user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # 2. Fetch all vaults belonging to this specific user
-    vaults = db.query(models.Vault).filter(models.Vault.owner_id == target_user_id).all()
-    
-    # 3. Package the vaults into a clean, readable format for the app
-    vault_data = []
-    for v in vaults:
-        vault_data.append({
-            "title": v.title,
-            "target": v.target,
-            "balance": v.balance,
-            "is_completed": v.balance >= v.target
-        })
-        
-    # 4. Ship the bundled profile back to the phone
-    return {
-        "username": user.username,
-        "current_streak": user.current_streak,
-        "total_saved": user.total_saved,
-        "vaults": vault_data
-    }
