@@ -15,6 +15,7 @@ class UserResponse(UserBase):
     id: int
     current_streak: int
     total_saved: float
+    avatar: str = "User"  # <--- We added the avatar field right here
 
     # This tells Pydantic it's okay to read data directly from our SQLAlchemy database models
     class Config:
