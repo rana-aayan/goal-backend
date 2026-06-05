@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 import models, schemas
 from database import engine, SessionLocal
+from datetime import datetime, date, timedelta
 
 # Create tables
 models.Base.metadata.create_all(bind=engine)
@@ -40,13 +41,7 @@ def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
     db.refresh(new_user)
     return new_user
 
-# --- LEADERBOARD ENDPOINT ---
 
-@app.get("/leaderboard/", response_model=list[schemas.UserResponse])
-def get_leaderboard(db: Session = Depends(get_db)):
-    # Grab the top 10 users with the highest total_saved
-    top_users = db.query(models.User).order_by(models.User.total_saved.desc()).limit(10).all()
-    return top_users
 
 from fastapi import HTTPException
 
@@ -66,7 +61,7 @@ def create_vault(vault: schemas.VaultCreate, db: Session = Depends(get_db)):
     return new_vault
 
 @app.get("/leaderboard/", response_model=list[schemas.UserResponse])
-def get_user_leaderboard(db: Session = Depends(get_db)):
+def get_leaderboard(db: Session = Depends(get_db)):
     top_users = db.query(models.User).order_by(models.User.total_saved.desc()).limit(10).all()
     
     # Active check: Reset streak to 0 if they haven't saved in over 48 hours
@@ -86,7 +81,7 @@ def get_user_leaderboard(db: Session = Depends(get_db)):
 
 # --- TRANSACTION & STREAK ENGINE ---
 
-from datetime import datetime, date, timedelta
+
 
 @app.post("/transactions/", response_model=schemas.TransactionResponse)
 def create_transaction(transaction: schemas.TransactionCreate, db: Session = Depends(get_db)):
@@ -141,3 +136,33 @@ def create_transaction(transaction: schemas.TransactionCreate, db: Session = Dep
     db.refresh(new_transaction)
 
     return new_transaction
+
+# --- PUBLIC PROFILE ENDPOINT ---
+
+@app.get("/users/{target_user_id}/profile")
+def get_user_profile(target_user_id: int, db: Session = Depends(get_db)):
+    # 1. Fetch the user's core stats
+    user = db.query(models.User).filter(models.User.id == target_user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # 2. Fetch all vaults belonging to this specific user
+    vaults = db.query(models.Vault).filter(models.Vault.owner_id == target_user_id).all()
+    
+    # 3. Package the vaults into a clean, readable format for the app
+    vault_data = []
+    for v in vaults:
+        vault_data.append({
+            "title": v.title,
+            "target": v.target,
+            "balance": v.balance,
+            "is_completed": v.balance >= v.target
+        })
+        
+    # 4. Ship the bundled profile back to the phone
+    return {
+        "username": user.username,
+        "current_streak": user.current_streak,
+        "total_saved": user.total_saved,
+        "vaults": vault_data
+    }
