@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from datetime import datetime, date, timedelta
+from pydantic import BaseModel
 import models, schemas
 from database import engine, SessionLocal
 
@@ -13,7 +14,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Dependency: Opens a database session for a request, then closes it when done
 def get_db():
     db = SessionLocal()
     try:
@@ -26,60 +26,77 @@ def health_check():
     return {"status": "online", "message": "API is live."}
 
 # ==========================================
-# --- USER ENDPOINTS ---
+# --- AUTH & USER ENDPOINTS ---
 # ==========================================
+
+class LoginRequest(BaseModel):
+    username: str
+
+class ProfileUpdate(BaseModel):
+    username: str
+    avatar: str
+
+@app.post("/login/")
+def login_user(req: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.username == req.username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Username not found. Please register.")
+    return user
 
 @app.post("/users/", response_model=schemas.UserResponse)
 def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
-    # Check if username is taken
     existing_user = db.query(models.User).filter(models.User.username == user.username).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="Username already taken.")
     
-    # Create the new user
     new_user = models.User(username=user.username, expo_push_token=user.expo_push_token)
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     return new_user
 
+@app.put("/users/{user_id}/profile")
+def update_profile(user_id: int, req: ProfileUpdate, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Prevent stealing someone else's username
+    if req.username != user.username:
+        conflict = db.query(models.User).filter(models.User.username == req.username).first()
+        if conflict:
+            raise HTTPException(status_code=400, detail="Username already taken.")
+            
+    user.username = req.username
+    user.avatar = req.avatar
+    db.commit()
+    db.refresh(user)
+    return user
+
 @app.get("/users/{target_user_id}/profile")
 def get_user_profile(target_user_id: int, db: Session = Depends(get_db)):
-    # 1. Find the user
     user = db.query(models.User).filter(models.User.id == target_user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # 2. Find all vaults belonging to this user
     vaults = db.query(models.Vault).filter(models.Vault.owner_id == target_user_id).all()
-    
-    # 3. Format the vaults for the public profile
-    vault_data = []
-    for v in vaults:
-        vault_data.append({
-            "title": v.title,
-            "target": v.target,
-            "balance": v.balance,
-            "is_completed": v.balance >= v.target
-        })
+    vault_data = [{"title": v.title, "target": v.target, "balance": v.balance, "is_completed": v.balance >= v.target} for v in vaults]
         
     return {
         "username": user.username,
+        "avatar": getattr(user, 'avatar', 'User'),
         "current_streak": user.current_streak,
         "total_saved": user.total_saved,
         "vaults": vault_data
     }
 
 # ==========================================
-# --- LEADERBOARD ENDPOINT ---
+# --- LEADERBOARD & VAULTS ---
 # ==========================================
 
 @app.get("/leaderboard/", response_model=list[schemas.UserResponse])
 def get_leaderboard(db: Session = Depends(get_db)):
-    # Grab the top 10 users
     top_users = db.query(models.User).order_by(models.User.total_saved.desc()).limit(10).all()
-    
-    # Active check: Reset streak to 0 if they haven't saved in over 48 hours
     today_date = date.today()
     for user in top_users:
         last_tx = db.query(models.Transaction).filter(
@@ -91,20 +108,13 @@ def get_leaderboard(db: Session = Depends(get_db)):
         if last_tx and (today_date - last_tx.timestamp.date()).days > 1:
             user.current_streak = 0
             db.commit()
-            
     return top_users
-
-# ==========================================
-# --- VAULT ENDPOINTS ---
-# ==========================================
 
 @app.post("/vaults/", response_model=schemas.VaultResponse)
 def create_vault(vault: schemas.VaultCreate, db: Session = Depends(get_db)):
-    # Verify the user actually exists first
     user = db.query(models.User).filter(models.User.id == vault.owner_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
-
     new_vault = models.Vault(**vault.model_dump())
     db.add(new_vault)
     db.commit()
@@ -112,7 +122,7 @@ def create_vault(vault: schemas.VaultCreate, db: Session = Depends(get_db)):
     return new_vault
 
 # ==========================================
-# --- TRANSACTION & STREAK ENGINE ---
+# --- TRANSACTION ENGINE ---
 # ==========================================
 
 @app.post("/transactions/", response_model=schemas.TransactionResponse)
@@ -127,11 +137,8 @@ def create_transaction(transaction: schemas.TransactionCreate, db: Session = Dep
         vault.balance += transaction.amount
         user.total_saved += transaction.amount
         
-        # --- SMART DAILY STREAK LOGIC ---
         if transaction.amount >= 10:
             today_date = date.today()
-            
-            # Find the user's last deposit of 10 PKR or more
             last_deposit = db.query(models.Transaction).filter(
                 models.Transaction.user_id == user.id,
                 models.Transaction.type == 'deposit',
@@ -139,17 +146,12 @@ def create_transaction(transaction: schemas.TransactionCreate, db: Session = Dep
             ).order_by(models.Transaction.timestamp.desc()).first()
 
             if last_deposit:
-                last_deposit_date = last_deposit.timestamp.date()
-                days_difference = (today_date - last_deposit_date).days
-
+                days_difference = (today_date - last_deposit.timestamp.date()).days
                 if days_difference == 1:
-                    # Deposited yesterday! Increment streak
                     user.current_streak += 1
                 elif days_difference > 1:
-                    # Missed a day. Streak shatters and resets to 1
                     user.current_streak = 1
             else:
-                # First time depositing ever
                 user.current_streak = 1
             
     elif transaction.type == 'withdraw':
@@ -165,5 +167,4 @@ def create_transaction(transaction: schemas.TransactionCreate, db: Session = Dep
     db.add(new_transaction)
     db.commit()
     db.refresh(new_transaction)
-
     return new_transaction

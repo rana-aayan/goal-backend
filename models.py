@@ -11,7 +11,7 @@ class User(Base):
     expo_push_token = Column(String, nullable=True) # For social notifications
     current_streak = Column(Integer, default=0)
     total_saved = Column(Float, default=0.0)
-    
+    avatar = Column(String, default="User")
     vaults = relationship("Vault", back_populates="owner")
     transactions = relationship("Transaction", back_populates="user")
 
