@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from datetime import datetime, date, timedelta
 from pydantic import BaseModel
@@ -12,6 +13,15 @@ app = FastAPI(
     title="Goal Backend",
     description="The engine powering the social saving network.",
     version="1.0.0"
+)
+
+# Added CORS Middleware to ensure the React Native app can communicate freely
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 def get_db():
@@ -61,7 +71,6 @@ def update_profile(user_id: int, req: ProfileUpdate, db: Session = Depends(get_d
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Prevent stealing someone else's username
     if req.username != user.username:
         conflict = db.query(models.User).filter(models.User.username == req.username).first()
         if conflict:
@@ -90,6 +99,23 @@ def get_user_profile(target_user_id: int, db: Session = Depends(get_db)):
         "vaults": vault_data
     }
 
+# NEW: Completely wipe a user and safely cascade database deletions
+@app.delete("/users/{user_id}")
+def delete_user(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Manually cascade: delete all transactions tied to their vaults, then the vaults
+    vaults = db.query(models.Vault).filter(models.Vault.owner_id == user_id).all()
+    for v in vaults:
+        db.query(models.Transaction).filter(models.Transaction.vault_id == v.id).delete()
+        db.delete(v)
+
+    db.delete(user)
+    db.commit()
+    return {"message": "User and all associated data completely erased."}
+
 # ==========================================
 # --- LEADERBOARD & VAULTS ---
 # ==========================================
@@ -98,6 +124,8 @@ def get_user_profile(target_user_id: int, db: Session = Depends(get_db)):
 def get_leaderboard(db: Session = Depends(get_db)):
     top_users = db.query(models.User).order_by(models.User.total_saved.desc()).limit(10).all()
     today_date = date.today()
+    
+    streaks_changed = False
     for user in top_users:
         last_tx = db.query(models.Transaction).filter(
             models.Transaction.user_id == user.id,
@@ -107,7 +135,12 @@ def get_leaderboard(db: Session = Depends(get_db)):
         
         if last_tx and (today_date - last_tx.timestamp.date()).days > 1:
             user.current_streak = 0
-            db.commit()
+            streaks_changed = True
+            
+    # Committing outside the loop saves database processing power
+    if streaks_changed:
+        db.commit()
+        
     return top_users
 
 @app.post("/vaults/", response_model=schemas.VaultResponse)
@@ -120,6 +153,27 @@ def create_vault(vault: schemas.VaultCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_vault)
     return new_vault
+
+# NEW: Delete a vault, deduct its phantom money, and clean up transactions
+@app.delete("/vaults/{vault_id}")
+def delete_vault(vault_id: int, db: Session = Depends(get_db)):
+    vault = db.query(models.Vault).filter(models.Vault.id == vault_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="Vault not found")
+
+    user = db.query(models.User).filter(models.User.id == vault.owner_id).first()
+    if user:
+        # Fix the leaderboard math bug: Remove the vault's balance from the global total
+        user.total_saved -= vault.balance
+        if user.total_saved < 0:
+            user.total_saved = 0
+
+    # Wipe transaction history for this vault
+    db.query(models.Transaction).filter(models.Transaction.vault_id == vault_id).delete()
+
+    db.delete(vault)
+    db.commit()
+    return {"message": "Vault destroyed and global leaderboard score adjusted."}
 
 # ==========================================
 # --- TRANSACTION ENGINE ---
@@ -162,6 +216,8 @@ def create_transaction(transaction: schemas.TransactionCreate, db: Session = Dep
 
     if vault.balance >= vault.target:
         vault.is_completed = True
+    else:
+        vault.is_completed = False # Failsafe just in case money is withdrawn below the target
 
     new_transaction = models.Transaction(**transaction.model_dump())
     db.add(new_transaction)
